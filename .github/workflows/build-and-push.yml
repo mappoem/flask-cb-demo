@@ -1,21 +1,204 @@
-name: Build and Push Flask App Image
+name: Build → Push → Deploy (CloudBolt) → Test → Teardown
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
 
 jobs:
-  build:
+  build_deploy_test:
     runs-on: ubuntu-latest
+    env:
+      IMAGE_REPO: ghcr.io/${{ github.repository }}
+      IMAGE_TAG: ${{ github.sha }}
+      CB_INSECURE: ${{ vars.CB_INSECURE }} # set to "true" if self-signed certs
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Log in to GitHub Container Registry
-      run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-    - name: Build Docker image
-      run: docker build -t ghcr.io/${{ github.repository }}:${{ github.sha }} .
+      - name: Build Docker image
+        run: docker build -t $IMAGE_REPO:$IMAGE_TAG .
 
-    - name: Push Docker image
-      run: docker push ghcr.io/${{ github.repository }}:${{ github.sha }}
+      - name: Push Docker image
+        run: docker push $IMAGE_REPO:$IMAGE_TAG
+
+      - name: Install jq & curl
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl
+
+      - name: Compute curl SSL flag
+        id: curl_flags
+        run: |
+          if [ "${CB_INSECURE:-false}" = "true" ]; then
+            echo "flag=--insecure" >> $GITHUB_OUTPUT
+          else
+            echo "flag=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get CloudBolt API token
+        id: get_token
+        run: |
+          resp=$(curl -s ${{ steps.curl_flags.outputs.flag }} -X POST \
+            "${{ secrets.CB_BASE_URL }}/api/v3/cmp/apiToken/" \
+            -H "Accept: application/json" -H "Content-Type: application/json" \
+            -d "{\"username\":\"${{ secrets.CB_USER }}\",\"password\":\"${{ secrets.CB_USER_PASSWORD }}\"}")
+          echo "$resp"
+          token=$(echo "$resp" | jq -r '.token')
+          if [ -z "$token" ] || [ "$token" = "null" ]; then
+            echo "Failed to obtain CloudBolt token" >&2
+            exit 1
+          fi
+          echo "token=$token" >> $GITHUB_OUTPUT
+
+      - name: Create CloudBolt order (deploy blueprint)
+        id: create_order
+        run: |
+          IMAGE_FULL="${IMAGE_REPO}:${IMAGE_TAG}"
+
+          # Build payload with your known deployment items and dynamic image parameter
+          read -r -d '' PAYLOAD <<'JSON'
+          {
+            "deploymentItems": {
+              "plugin-bdi-ipppr9ja": { "parameters": {} },
+              "script-bdi-in42nqrx": { "parameters": {} },
+              "script-bdi-k8y73pqh": {
+                "parameters": {
+                  "image": "___IMAGE___"
+                }
+              },
+              "script-bdi-kapa01l8": { "parameters": {} },
+              "script-bdi-l5yxpsxd": { "parameters": {} },
+              "script-bdi-ti1aks7u": { "parameters": {} },
+              "server-bdi-8s22ypl4": {
+                "environment": "/api/v3/cmp/environments/ENV-kh021i2j/",
+                "osBuild": "/api/v3/cmp/osBuilds/OSB-qe8x525n/",
+                "parameters": {
+                  "acme_billing_code": "1234",
+                  "expiration_date": "2025-08-06"
+                }
+              }
+            },
+            "group": "/api/v3/cmp/groups/GRP-6nsw3vt8/",
+            "parameters": {}
+          }
+          JSON
+
+          PAYLOAD=${PAYLOAD//___IMAGE___/$IMAGE_FULL}
+
+          resp=$(curl -s ${{ steps.curl_flags.outputs.flag }} -X POST \
+            "${{ secrets.CB_BASE_URL }}/api/v3/cmp/orders/" \
+            -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+            -H "Accept: application/json" -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          echo "$resp"
+          order_id=$(echo "$resp" | jq -r '.id')
+          if [ -z "$order_id" ] || [ "$order_id" = "null" ]; then
+            echo "Failed to create order" >&2
+            exit 1
+          fi
+          echo "order_id=$order_id" >> $GITHUB_OUTPUT
+
+      - name: Wait for provisioning to complete
+        run: |
+          MAX_ATTEMPTS=40
+          INTERVAL=15
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            status=$(curl -s ${{ steps.curl_flags.outputs.flag }} \
+              "${{ secrets.CB_BASE_URL }}/api/v3/cmp/orders/${{ steps.create_order.outputs.order_id }}/" \
+              -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+              -H "Accept: application/json" | jq -r '.status')
+
+            echo "Attempt $i: status=$status"
+
+            if [ "$status" = "SUCCESS" ]; then
+              echo "Provisioning completed successfully."
+              break
+            elif [ "$status" = "FAILURE" ]; then
+              echo "Provisioning failed." >&2
+              exit 1
+            fi
+            sleep $INTERVAL
+          done
+        shell: bash
+
+      - name: Get app URL from Set Resource URL Job
+        id: app_url
+        env:
+          CB_FLAG: ${{ steps.curl_flags.outputs.flag }}
+        run: |
+          # Get the final order document
+          order_json=$(curl -s ${CB_FLAG} \
+            "${{ secrets.CB_BASE_URL }}/api/v3/cmp/orders/${{ steps.create_order.outputs.order_id }}/" \
+            -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+            -H "Accept: application/json")
+
+          echo "$order_json"
+
+          # $._links.jobs is an array containing an array of job objects; find the one whose title starts with "Set Resource URL Job"
+          job_href=$(echo "$order_json" \
+            | jq -r '._links.jobs[0][] | select(.title | startswith("Set Resource URL Job")) | .href')
+
+          if [ -z "$job_href" ] || [ "$job_href" = "null" ]; then
+            echo "Could not find 'Set Resource URL Job' in order links" >&2
+            exit 1
+          fi
+
+          # Compose absolute URL (href is like /api/v3/cmp/jobs/JOB-xxxx/)
+          # Ensure no trailing slash on base URL to avoid double slashes
+          base="${{ secrets.CB_BASE_URL }}"
+          base="${base%/}"
+          job_url="${base}${job_href}"
+
+          echo "Resolved job URL: $job_url"
+
+          # Fetch the job to read its output (expected: ["http://x.x.x.x:80"])
+          job_json=$(curl -s ${CB_FLAG} \
+            "$job_url" \
+            -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+            -H "Accept: application/json")
+
+          echo "$job_json"
+
+          app_url=$(echo "$job_json" | jq -r '.output[0]')
+          if [ -z "$app_url" ] || [ "$app_url" = "null" ]; then
+            echo "No URL found in job output" >&2
+            exit 1
+          fi
+
+          # Normalize (drop trailing slash)
+          app_url=${app_url%/}
+          echo "url=$app_url" >> $GITHUB_OUTPUT
+
+      - name: Health check
+        run: |
+          URL="${{ steps.app_url.outputs.url }}"
+          echo "Checking ${URL}/health ..."
+          for i in {1..12}; do
+            if curl -fs "${URL}/health"; then
+              echo "Health check OK"
+              exit 0
+            fi
+            echo "Health not ready yet, retrying ($i/12)..."
+            sleep 5
+          done
+          echo "Health check failed" >&2
+          exit 1
+
+      - name: Tear down environment
+        if: always()
+        run: |
+          SID="${{ steps.server_info.outputs.server_id }}"
+          if [ -n "$SID" ] && [ "$SID" != "null" ]; then
+            echo "Deleting server $SID ..."
+            curl -sS ${{ steps.curl_flags.outputs.flag }} -X DELETE \
+              "${{ secrets.CB_BASE_URL }}/api/v3/cmp/servers/$SID/" \
+              -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+              -H "Accept: application/json"
+          else
+            echo "No server_id available to delete."
+          fi
