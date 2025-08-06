@@ -204,7 +204,7 @@ jobs:
           # Get the final order document
           order_json=$(curl -s ${CB_FLAG} \
             "${{ secrets.CB_BASE_URL }}/api/v3/cmp/orders/${{ steps.create_order.outputs.order_id }}/" \
-            -H "Authorization: Bearer ${{ steps.wait_order.outputs.new_token }}" \
+            -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
             -H "Accept: application/json")
 
           echo "$order_json"
@@ -229,7 +229,7 @@ jobs:
           # Fetch the job to read its output (expected: ["http://x.x.x.x:80"])
           job_json=$(curl -s ${CB_FLAG} \
             "$job_url" \
-            -H "Authorization: Bearer ${{ steps.wait_order.outputs.new_token }}" \
+            -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
             -H "Accept: application/json")
 
           echo "$job_json"
