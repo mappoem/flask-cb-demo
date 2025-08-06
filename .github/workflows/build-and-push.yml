@@ -58,53 +58,53 @@ jobs:
 
       - name: Create CloudBolt order (deploy blueprint)
         id: create_order
+        env:
+          IMAGE_FULL: ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
         run: |
-          IMAGE_FULL="${IMAGE_REPO}:${IMAGE_TAG}"
+          # Normalize base URL (remove trailing slash)
+          BASE="${{ secrets.CB_BASE_URL }}"
+          BASE="${BASE%/}"
 
-          # Build payload with dynamic image parameter
-          read -r -d '' PAYLOAD <<'JSON'
-          {
-            "deploymentItems": {
-              "plugin-bdi-ipppr9ja": { "parameters": {} },
-              "script-bdi-in42nqrx": { "parameters": {} },
-              "script-bdi-k8y73pqh": {
-                "parameters": {
-                  "image": "___IMAGE___"
+          DEPLOY_URL="$BASE/api/v3/cmp/blueprints/${{ secrets.CB_BLUEPRINT_ID_FLASK }}/deploy/"
+
+          # Build payload with jq to avoid quoting issues
+          PAYLOAD=$(jq -n \
+            --arg img "$IMAGE_FULL" \
+            '{
+              deploymentItems: {
+                "plugin-bdi-ipppr9ja": {parameters: {}},
+                "script-bdi-in42nqrx": {parameters: {}},
+                "script-bdi-k8y73pqh": {parameters: {image: $img}},
+                "script-bdi-kapa01l8": {parameters: {}},
+                "script-bdi-l5yxpsxd": {parameters: {}},
+                "script-bdi-ti1aks7u": {parameters: {}},
+                "server-bdi-8s22ypl4": {
+                  environment: "/api/v3/cmp/environments/ENV-kh021i2j/",
+                  osBuild: "/api/v3/cmp/osBuilds/OSB-qe8x525n/",
+                  parameters: {
+                    acme_billing_code: "1234",
+                    expiration_date: "2025-08-08"
+                  }
                 }
               },
-              "script-bdi-kapa01l8": { "parameters": {} },
-              "script-bdi-l5yxpsxd": { "parameters": {} },
-              "script-bdi-ti1aks7u": { "parameters": {} },
-              "server-bdi-8s22ypl4": {
-                "environment": "/api/v3/cmp/environments/ENV-kh021i2j/",
-                "osBuild": "/api/v3/cmp/osBuilds/OSB-qe8x525n/",
-                "parameters": {
-                  "acme_billing_code": "1234",
-                  "expiration_date": "2025-08-08"
-                }
-              }
-            },
-            "group": "/api/v3/cmp/groups/GRP-6nsw3vt8/",
-            "parameters": {}
-          }
-          JSON
-
-          PAYLOAD=${PAYLOAD//___IMAGE___/$IMAGE_FULL}
+              group: "/api/v3/cmp/groups/GRP-6nsw3vt8/",
+              parameters: {}
+            }')
 
           # Use computed SSL flag; default to --insecure if unset
           CURL_FLAG='${{ steps.curl_flags.outputs.flag }}'
           if [ -z "$CURL_FLAG" ]; then CURL_FLAG="--insecure"; fi
 
-          # Call the *deploy* endpoint with Bearer (matches your Postman call)
-          DEPLOY_URL="${{ secrets.CB_BASE_URL }}/api/v3/cmp/blueprints/${{ secrets.CB_BLUEPRINT_ID_FLASK }}/deploy/"
-
+          # Call deploy endpoint with Bearer token (matches your Postman call)
           http_code=$(curl -s -o /tmp/order_resp.json -w "%{http_code}" $CURL_FLAG -X POST \
             "$DEPLOY_URL" \
             -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
-            -H "Accept: application/json" -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
             -d "$PAYLOAD")
 
           echo "HTTP $http_code"
+          echo "Response body:"
           cat /tmp/order_resp.json
 
           order_id=$(jq -r '.id' /tmp/order_resp.json)
