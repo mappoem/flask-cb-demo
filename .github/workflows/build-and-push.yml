@@ -204,7 +204,7 @@ jobs:
           # Get the final order document
           order_json=$(curl -s ${CB_FLAG} \
             "${{ secrets.CB_BASE_URL }}/api/v3/cmp/orders/${{ steps.create_order.outputs.order_id }}/" \
-            -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+            -H "Authorization: Bearer ${{ steps.wait_order.outputs.new_token }}" \
             -H "Accept: application/json")
 
           echo "$order_json"
