@@ -202,18 +202,19 @@ jobs:
           CB_FLAG: ${{ steps.curl_flags.outputs.flag }}
         run: |
           set -euo pipefail
+
           BASE="${{ secrets.CB_BASE_URL }}"; BASE="${BASE%/}"
           ORDER_ID="${{ steps.create_order.outputs.order_id }}"
           ORDER_URL="$BASE/api/v3/cmp/orders/${ORDER_ID}/"
-
           TOKEN="${{ steps.get_token.outputs.token }}"
 
-          get_with_token () {
+          get_json () {
             # args: URL
             local url="$1"
-            curl -s ${CB_FLAG} -w "\n%{http_code}" \
+            curl -s ${CB_FLAG} \
               -H "Authorization: Bearer ${TOKEN}" \
               -H "Accept: application/json" \
+              -w "HTTPSTATUS:%{http_code}" \
               "$url"
           }
 
@@ -230,19 +231,32 @@ jobs:
             TOKEN="$newtok"
           }
 
-          # --- Fetch order JSON (retry once on 401) ---
-          read -r body status <<<"$(get_with_token "$ORDER_URL")"
-          if [ "$status" = "401" ]; then
-            refresh_token
-            read -r body status <<<"$(get_with_token "$ORDER_URL")"
+          fetch_or_401_retry () {
+            # args: URL -> prints body and sets HTTP_CODE
+            local url="$1"
+            local raw
+            raw="$(get_json "$url")"
+            HTTP_CODE="${raw##*HTTPSTATUS:}"
+            BODY="${raw%HTTPSTATUS:*}"
+            if [ "$HTTP_CODE" = "401" ]; then
+              echo "Got 401; token likely expired."
+              refresh_token
+              raw="$(get_json "$url")"
+              HTTP_CODE="${raw##*HTTPSTATUS:}"
+              BODY="${raw%HTTPSTATUS:*}"
+            fi
+          }
+
+          # --- 1) Get order JSON ---
+          fetch_or_401_retry "$ORDER_URL"
+          echo "Order HTTP $HTTP_CODE"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "$BODY"; exit 1
           fi
-          if [ "$status" != "200" ]; then
-            echo "Order GET failed: HTTP $status"; echo "$body"; exit 1
-          fi
-          echo "$body" > /tmp/order.json
+          echo "$BODY" > /tmp/order.json
           cat /tmp/order.json
 
-          # Find the "Set Resource URL Job ..." link
+          # jobs link can be nested array-of-arrays; handle defensively
           job_href=$(jq -r '._links.jobs[]?[]? | select(.title | startswith("Set Resource URL Job")) | .href' /tmp/order.json)
           if [ -z "${job_href:-}" ] || [ "$job_href" = "null" ]; then
             echo "Could not find 'Set Resource URL Job' in order links"; exit 1
@@ -250,20 +264,17 @@ jobs:
           job_url="${BASE}${job_href}"
           echo "Resolved job URL: $job_url"
 
-          # --- Fetch the job JSON (retry once on 401) ---
-          read -r body status <<<"$(get_with_token "$job_url")"
-          if [ "$status" = "401" ]; then
-            refresh_token
-            read -r body status <<<"$(get_with_token "$job_url")"
+          # --- 2) Get job JSON ---
+          fetch_or_401_retry "$job_url"
+          echo "Job HTTP $HTTP_CODE"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "$BODY"; exit 1
           fi
-          if [ "$status" != "200" ]; then
-            echo "Job GET failed: HTTP $status"; echo "$body"; exit 1
-          fi
-          echo "$body" > /tmp/job.json
+          echo "$BODY" > /tmp/job.json
           cat /tmp/job.json
 
-          # Extract the URL
-          app_url=$(jq -r '.output[0]' /tmp/job.json)
+          # Your job output is a STRING at .output (not an array)
+          app_url=$(jq -r '.output // (.outputs[0] // empty)' /tmp/job.json)
           if [ -z "${app_url:-}" ] || [ "$app_url" = "null" ]; then
             echo "No URL found in job output"; exit 1
           fi
