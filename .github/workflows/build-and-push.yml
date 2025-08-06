@@ -12,6 +12,8 @@ jobs:
       IMAGE_REPO: ghcr.io/${{ github.repository }}
       IMAGE_TAG: ${{ github.sha }}
       CB_INSECURE: ${{ vars.CB_INSECURE }} # set to "true" if self-signed certs
+
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -78,7 +80,7 @@ jobs:
                 "osBuild": "/api/v3/cmp/osBuilds/OSB-qe8x525n/",
                 "parameters": {
                   "acme_billing_code": "1234",
-                  "expiration_date": "2025-08-06"
+                  "expiration_date": "2025-08-08"
                 }
               }
             },
