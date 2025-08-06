@@ -209,7 +209,6 @@ jobs:
           TOKEN="${{ steps.get_token.outputs.token }}"
 
           get_json () {
-            # args: URL
             local url="$1"
             curl -s ${CB_FLAG} \
               -H "Authorization: Bearer ${TOKEN}" \
@@ -224,15 +223,13 @@ jobs:
               "$BASE/api/v3/cmp/apiToken/" \
               -H "Accept: application/json" -H "Content-Type: application/json" \
               -d "{\"username\":\"${{ secrets.CB_USER }}\",\"password\":\"${{ secrets.CB_USER_PASSWORD }}\"}")
-            newtok=$(echo "$resp" | jq -r '.token')
-            if [ -z "$newtok" ] || [ "$newtok" = "null" ]; then
+            TOKEN=$(echo "$resp" | jq -r '.token')
+            if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
               echo "Failed to refresh token"; echo "$resp"; exit 1
             fi
-            TOKEN="$newtok"
           }
 
           fetch_or_401_retry () {
-            # args: URL -> prints body and sets HTTP_CODE
             local url="$1"
             local raw
             raw="$(get_json "$url")"
@@ -247,7 +244,7 @@ jobs:
             fi
           }
 
-          # --- 1) Get order JSON ---
+          # 1) Order JSON
           fetch_or_401_retry "$ORDER_URL"
           echo "Order HTTP $HTTP_CODE"
           if [ "$HTTP_CODE" != "200" ]; then
@@ -256,15 +253,15 @@ jobs:
           echo "$BODY" > /tmp/order.json
           cat /tmp/order.json
 
-          # jobs link can be nested array-of-arrays; handle defensively
-          job_href=$(jq -r '._links.jobs[]?[]? | select(.title | startswith("Set Resource URL Job")) | .href' /tmp/order.json)
+          # FIXED jq: jobs is a flat array
+          job_href=$(jq -r '._links.jobs[] | select(.title | startswith("Set Resource URL Job")) | .href' /tmp/order.json)
           if [ -z "${job_href:-}" ] || [ "$job_href" = "null" ]; then
             echo "Could not find 'Set Resource URL Job' in order links"; exit 1
           fi
           job_url="${BASE}${job_href}"
           echo "Resolved job URL: $job_url"
 
-          # --- 2) Get job JSON ---
+          # 2) Job JSON
           fetch_or_401_retry "$job_url"
           echo "Job HTTP $HTTP_CODE"
           if [ "$HTTP_CODE" != "200" ]; then
@@ -273,7 +270,7 @@ jobs:
           echo "$BODY" > /tmp/job.json
           cat /tmp/job.json
 
-          # Your job output is a STRING at .output (not an array)
+          # In your instance, the job URL is a STRING at .output
           app_url=$(jq -r '.output // (.outputs[0] // empty)' /tmp/job.json)
           if [ -z "${app_url:-}" ] || [ "$app_url" = "null" ]; then
             echo "No URL found in job output"; exit 1
