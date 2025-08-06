@@ -61,7 +61,7 @@ jobs:
         run: |
           IMAGE_FULL="${IMAGE_REPO}:${IMAGE_TAG}"
 
-          # Build payload with your known deployment items and dynamic image parameter
+          # Build payload with dynamic image parameter
           read -r -d '' PAYLOAD <<'JSON'
           {
             "deploymentItems": {
@@ -91,14 +91,23 @@ jobs:
 
           PAYLOAD=${PAYLOAD//___IMAGE___/$IMAGE_FULL}
 
-          resp=$(curl -s ${{ steps.curl_flags.outputs.flag }} -X POST \
-            "${{ secrets.CB_BASE_URL }}/api/v3/cmp/orders/" \
+          # Use computed SSL flag; default to --insecure if unset
+          CURL_FLAG='${{ steps.curl_flags.outputs.flag }}'
+          if [ -z "$CURL_FLAG" ]; then CURL_FLAG="--insecure"; fi
+
+          # Call the *deploy* endpoint with Bearer (matches your Postman call)
+          DEPLOY_URL="${{ secrets.CB_BASE_URL }}/api/v3/cmp/blueprints/${{ secrets.CB_BLUEPRINT_ID_FLASK }}/deploy/"
+
+          http_code=$(curl -s -o /tmp/order_resp.json -w "%{http_code}" $CURL_FLAG -X POST \
+            "$DEPLOY_URL" \
             -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
             -H "Accept: application/json" -H "Content-Type: application/json" \
             -d "$PAYLOAD")
 
-          echo "$resp"
-          order_id=$(echo "$resp" | jq -r '.id')
+          echo "HTTP $http_code"
+          cat /tmp/order_resp.json
+
+          order_id=$(jq -r '.id' /tmp/order_resp.json)
           if [ -z "$order_id" ] || [ "$order_id" = "null" ]; then
             echo "Failed to create order" >&2
             exit 1
