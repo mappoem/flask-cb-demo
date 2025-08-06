@@ -115,27 +115,86 @@ jobs:
           echo "order_id=$order_id" >> $GITHUB_OUTPUT
 
       - name: Wait for provisioning to complete
+        id: wait_order
+        env:
+          ORDER_ID: ${{ steps.create_order.outputs.order_id }}
         run: |
-          MAX_ATTEMPTS=40
+          BASE="${{ secrets.CB_BASE_URL }}"; BASE="${BASE%/}"
+          ORDER_URL="$BASE/api/v3/cmp/orders/${ORDER_ID}/"
+          CURL_FLAG='${{ steps.curl_flags.outputs.flag }}'
+          if [ -z "$CURL_FLAG" ]; then CURL_FLAG="--insecure"; fi
+
+          # helper: get status with http code
+          get_status () {
+            http_code=$(curl -s -o /tmp/order.json -w "%{http_code}" $CURL_FLAG \
+              "$ORDER_URL" \
+              -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
+              -H "Accept: application/json")
+            status=$(jq -r '.status // empty' /tmp/order.json 2>/dev/null || true)
+            echo "$http_code" > /tmp/http_code.txt
+            echo "$status" > /tmp/status.txt
+          }
+
+          MAX_ATTEMPTS=60   # up to 15 minutes with INTERVAL=15
           INTERVAL=15
           for i in $(seq 1 $MAX_ATTEMPTS); do
-            status=$(curl -s ${{ steps.curl_flags.outputs.flag }} \
-              "${{ secrets.CB_BASE_URL }}/api/v3/cmp/orders/${{ steps.create_order.outputs.order_id }}/" \
-              -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
-              -H "Accept: application/json" | jq -r '.status')
+            get_status
+            http_code=$(cat /tmp/http_code.txt)
+            status=$(cat /tmp/status.txt)
 
-            echo "Attempt $i: status=$status"
+            echo "Attempt $i: HTTP=$http_code, status=${status:-<empty>}"
 
-            if [ "$status" = "SUCCESS" ]; then
-              echo "Provisioning completed successfully."
-              break
-            elif [ "$status" = "FAILURE" ]; then
-              echo "Provisioning failed." >&2
-              exit 1
+            # Re-auth if token expired mid-run
+            if [ "$http_code" = "401" ]; then
+              echo "Token expired; refreshing…"
+              token_resp=$(curl -s $CURL_FLAG -X POST \
+                "$BASE/api/v3/cmp/apiToken/" \
+                -H "Accept: application/json" -H "Content-Type: application/json" \
+                -d "{\"username\":\"${{ secrets.CB_USER }}\",\"password\":\"${{ secrets.CB_USER_PASSWORD }}\"}")
+              new_token=$(echo "$token_resp" | jq -r '.token')
+              if [ -z "$new_token" ] || [ "$new_token" = "null" ]; then
+                echo "Failed to refresh token"; cat /tmp/order.json; exit 1
+              fi
+              # overwrite the previous output (GitHub doesn't let us mutate prior step outputs, so we just reuse in this step)
+              export CB_RUNTIME_TOKEN="$new_token"
+              # re-run with fresh token
+              http_code=$(curl -s -o /tmp/order.json -w "%{http_code}" $CURL_FLAG \
+                "$ORDER_URL" \
+                -H "Authorization: Bearer $CB_RUNTIME_TOKEN" \
+                -H "Accept: application/json")
+              status=$(jq -r '.status // empty' /tmp/order.json 2>/dev/null || true)
+              echo "After refresh: HTTP=$http_code, status=${status:-<empty>}"
             fi
+
+            # Normalize and decide
+            case "$status" in
+              SUCCESS)
+                echo "Provisioning completed successfully."
+                exit 0
+                ;;
+              FAILURE|ERROR|ABORTED|CANCELED)
+                echo "Provisioning ended with status: $status" >&2
+                cat /tmp/order.json
+                exit 1
+                ;;
+              "" )
+                # Unexpected/empty status -> print payload to debug, then keep trying a bit
+                echo "Warning: empty status; body was:"; cat /tmp/order.json
+                ;;
+              ACTIVE|PENDING|QUEUED|RUNNING|IN_PROGRESS)
+                # keep waiting
+                ;;
+              * )
+                # Unknown status — log and keep waiting a few cycles
+                echo "Unknown status '$status'; body:"; cat /tmp/order.json
+                ;;
+            esac
+
             sleep $INTERVAL
           done
-        shell: bash
+
+          echo "Timed out waiting for provisioning to complete." >&2
+          exit 1
 
       - name: Get app URL from Set Resource URL Job
         id: app_url
