@@ -201,46 +201,72 @@ jobs:
         env:
           CB_FLAG: ${{ steps.curl_flags.outputs.flag }}
         run: |
-          # Get the final order document
-          order_json=$(curl -s ${CB_FLAG} \
-            "${{ secrets.CB_BASE_URL }}/api/v3/cmp/orders/${{ steps.create_order.outputs.order_id }}/" \
-            -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
-            -H "Accept: application/json")
+          set -euo pipefail
+          BASE="${{ secrets.CB_BASE_URL }}"; BASE="${BASE%/}"
+          ORDER_ID="${{ steps.create_order.outputs.order_id }}"
+          ORDER_URL="$BASE/api/v3/cmp/orders/${ORDER_ID}/"
 
-          echo "$order_json"
+          TOKEN="${{ steps.get_token.outputs.token }}"
 
-          # $._links.jobs is an array containing an array of job objects; find the one whose title starts with "Set Resource URL Job"
-          job_href=$(echo "$order_json" \
-            | jq -r '._links.jobs[0][] | select(.title | startswith("Set Resource URL Job")) | .href')
+          get_with_token () {
+            # args: URL
+            local url="$1"
+            curl -s ${CB_FLAG} -w "\n%{http_code}" \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/json" \
+              "$url"
+          }
 
-          if [ -z "$job_href" ] || [ "$job_href" = "null" ]; then
-            echo "Could not find 'Set Resource URL Job' in order links" >&2
-            exit 1
+          refresh_token () {
+            echo "Refreshing CloudBolt token..."
+            resp=$(curl -s ${CB_FLAG} -X POST \
+              "$BASE/api/v3/cmp/apiToken/" \
+              -H "Accept: application/json" -H "Content-Type: application/json" \
+              -d "{\"username\":\"${{ secrets.CB_USER }}\",\"password\":\"${{ secrets.CB_USER_PASSWORD }}\"}")
+            newtok=$(echo "$resp" | jq -r '.token')
+            if [ -z "$newtok" ] || [ "$newtok" = "null" ]; then
+              echo "Failed to refresh token"; echo "$resp"; exit 1
+            fi
+            TOKEN="$newtok"
+          }
+
+          # --- Fetch order JSON (retry once on 401) ---
+          read -r body status <<<"$(get_with_token "$ORDER_URL")"
+          if [ "$status" = "401" ]; then
+            refresh_token
+            read -r body status <<<"$(get_with_token "$ORDER_URL")"
           fi
+          if [ "$status" != "200" ]; then
+            echo "Order GET failed: HTTP $status"; echo "$body"; exit 1
+          fi
+          echo "$body" > /tmp/order.json
+          cat /tmp/order.json
 
-          # Compose absolute URL (href is like /api/v3/cmp/jobs/JOB-xxxx/)
-          # Ensure no trailing slash on base URL to avoid double slashes
-          base="${{ secrets.CB_BASE_URL }}"
-          base="${base%/}"
-          job_url="${base}${job_href}"
-
+          # Find the "Set Resource URL Job ..." link
+          job_href=$(jq -r '._links.jobs[]?[]? | select(.title | startswith("Set Resource URL Job")) | .href' /tmp/order.json)
+          if [ -z "${job_href:-}" ] || [ "$job_href" = "null" ]; then
+            echo "Could not find 'Set Resource URL Job' in order links"; exit 1
+          fi
+          job_url="${BASE}${job_href}"
           echo "Resolved job URL: $job_url"
 
-          # Fetch the job to read its output (expected: ["http://x.x.x.x:80"])
-          job_json=$(curl -s ${CB_FLAG} \
-            "$job_url" \
-            -H "Authorization: Bearer ${{ steps.get_token.outputs.token }}" \
-            -H "Accept: application/json")
-
-          echo "$job_json"
-
-          app_url=$(echo "$job_json" | jq -r '.output[0]')
-          if [ -z "$app_url" ] || [ "$app_url" = "null" ]; then
-            echo "No URL found in job output" >&2
-            exit 1
+          # --- Fetch the job JSON (retry once on 401) ---
+          read -r body status <<<"$(get_with_token "$job_url")"
+          if [ "$status" = "401" ]; then
+            refresh_token
+            read -r body status <<<"$(get_with_token "$job_url")"
           fi
+          if [ "$status" != "200" ]; then
+            echo "Job GET failed: HTTP $status"; echo "$body"; exit 1
+          fi
+          echo "$body" > /tmp/job.json
+          cat /tmp/job.json
 
-          # Normalize (drop trailing slash)
+          # Extract the URL
+          app_url=$(jq -r '.output[0]' /tmp/job.json)
+          if [ -z "${app_url:-}" ] || [ "$app_url" = "null" ]; then
+            echo "No URL found in job output"; exit 1
+          fi
           app_url=${app_url%/}
           echo "url=$app_url" >> $GITHUB_OUTPUT
 
